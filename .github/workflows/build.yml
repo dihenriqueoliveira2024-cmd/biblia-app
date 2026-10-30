@@ -1,0 +1,452 @@
+name: Build APK
+
+# Único arquivo necessário no repositório: .github/workflows/build.yml
+# Ele cria o projeto inteiro (código, pubspec, Bíblia) e gera o APK.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Criar projeto Flutter
+        run: |
+          flutter create --platforms=android --project-name biblia_app --org com.exemplo .
+          rm -rf test
+
+      - name: Escrever pubspec.yaml
+        run: |
+          cat > pubspec.yaml <<'EOF'
+          name: biblia_app
+          description: Leitor da Bíblia Sagrada
+          publish_to: none
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.3.0 <5.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            shared_preferences: ^2.2.3
+
+          flutter:
+            uses-material-design: true
+            assets:
+              - assets/bibles/
+          EOF
+
+      - name: Escrever lib/main.dart
+        run: |
+          cat > lib/main.dart <<'EOF'
+          import 'dart:convert';
+          import 'package:flutter/foundation.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          const bookNames = [
+            'Gênesis', 'Êxodo', 'Levítico', 'Números', 'Deuteronômio', 'Josué', 'Juízes',
+            'Rute', '1 Samuel', '2 Samuel', '1 Reis', '2 Reis', '1 Crônicas',
+            '2 Crônicas', 'Esdras', 'Neemias', 'Ester', 'Jó', 'Salmos', 'Provérbios',
+            'Eclesiastes', 'Cantares', 'Isaías', 'Jeremias', 'Lamentações', 'Ezequiel',
+            'Daniel', 'Oseias', 'Joel', 'Amós', 'Obadias', 'Jonas', 'Miqueias', 'Naum',
+            'Habacuque', 'Sofonias', 'Ageu', 'Zacarias', 'Malaquias', 'Mateus', 'Marcos',
+            'Lucas', 'João', 'Atos', 'Romanos', '1 Coríntios', '2 Coríntios', 'Gálatas',
+            'Efésios', 'Filipenses', 'Colossenses', '1 Tessalonicenses',
+            '2 Tessalonicenses', '1 Timóteo', '2 Timóteo', 'Tito', 'Filemom', 'Hebreus',
+            'Tiago', '1 Pedro', '2 Pedro', '1 João', '2 João', '3 João', 'Judas',
+            'Apocalipse',
+          ];
+
+          // ---------- Dados ----------
+
+          class Bible {
+            final String id;
+            // livros -> capítulos -> versículos
+            final List<List<List<String>>> books;
+            Bible(this.id, this.books);
+          }
+
+          Bible parseBible(List<String> args) {
+            final data = jsonDecode(args[1].replaceFirst('\uFEFF', '')) as List;
+            final books = data.map<List<List<String>>>((b) {
+              final chs = (b as Map)['chapters'] as List;
+              return chs
+                  .map<List<String>>(
+                      (c) => (c as List).map((v) => v.toString()).toList())
+                  .toList();
+            }).toList();
+            return Bible(args[0], books);
+          }
+
+          class Store {
+            static final _cache = <String, Bible>{};
+
+            static Future<List<String>> versions() async {
+              final m = await AssetManifest.loadFromAssetBundle(rootBundle);
+              final l = m
+                  .listAssets()
+                  .where((a) => a.startsWith('assets/bibles/') && a.endsWith('.json'))
+                  .map((a) => a.split('/').last.replaceAll('.json', ''))
+                  .toList()
+                ..sort();
+              return l;
+            }
+
+            static Future<Bible> load(String id) async {
+              if (_cache.containsKey(id)) return _cache[id]!;
+              final raw = await rootBundle.loadString('assets/bibles/$id.json');
+              final b = await compute(parseBible, [id, raw]);
+              _cache[id] = b;
+              return b;
+            }
+          }
+
+          // ---------- Estado ----------
+
+          class AppController extends ChangeNotifier {
+            AppController(this.prefs)
+                : dark = prefs.getBool('dark') ?? false,
+                  font = prefs.getDouble('font') ?? 18,
+                  version = prefs.getString('version') ?? '',
+                  book = prefs.getInt('book') ?? 0,
+                  chapter = prefs.getInt('chapter') ?? 0;
+
+            final SharedPreferences prefs;
+            bool dark;
+            double font;
+            String version;
+            int book;
+            int chapter;
+
+            void setDark(bool v) {
+              dark = v;
+              prefs.setBool('dark', v);
+              notifyListeners();
+            }
+
+            void setFont(double v) {
+              font = v.clamp(12, 36).toDouble();
+              prefs.setDouble('font', font);
+              notifyListeners();
+            }
+
+            void setVersion(String v) {
+              version = v;
+              prefs.setString('version', v);
+              notifyListeners();
+            }
+
+            void setLast(int b, int c) {
+              book = b;
+              chapter = c;
+              prefs.setInt('book', b);
+              prefs.setInt('chapter', c);
+            }
+          }
+
+          // ---------- App ----------
+
+          Future<void> main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            final prefs = await SharedPreferences.getInstance();
+            runApp(BibleApp(AppController(prefs)));
+          }
+
+          class BibleApp extends StatelessWidget {
+            const BibleApp(this.c, {super.key});
+            final AppController c;
+
+            @override
+            Widget build(BuildContext context) {
+              return ListenableBuilder(
+                listenable: c,
+                builder: (_, __) => MaterialApp(
+                  title: 'Bíblia',
+                  debugShowCheckedModeBanner: false,
+                  themeMode: c.dark ? ThemeMode.dark : ThemeMode.light,
+                  theme: ThemeData(
+                    useMaterial3: true,
+                    colorScheme: ColorScheme.fromSeed(seedColor: Colors.brown),
+                  ),
+                  darkTheme: ThemeData(
+                    useMaterial3: true,
+                    colorScheme: ColorScheme.fromSeed(
+                        seedColor: Colors.brown, brightness: Brightness.dark),
+                  ),
+                  home: BooksPage(c),
+                ),
+              );
+            }
+          }
+
+          // ---------- Lista de livros ----------
+
+          class BooksPage extends StatefulWidget {
+            const BooksPage(this.c, {super.key});
+            final AppController c;
+            @override
+            State<BooksPage> createState() => _BooksPageState();
+          }
+
+          class _BooksPageState extends State<BooksPage> {
+            List<String> versions = [];
+            Bible? bible;
+            String? error;
+
+            AppController get c => widget.c;
+
+            @override
+            void initState() {
+              super.initState();
+              _load();
+            }
+
+            Future<void> _load() async {
+              try {
+                final vs = await Store.versions();
+                if (vs.isEmpty) throw 'Nenhum arquivo .json em assets/bibles/';
+                if (!vs.contains(c.version)) c.setVersion(vs.first);
+                final b = await Store.load(c.version);
+                if (!mounted) return;
+                setState(() {
+                  versions = vs;
+                  bible = b;
+                  error = null;
+                });
+              } catch (e) {
+                if (mounted) setState(() => error = '$e');
+              }
+            }
+
+            Future<void> _open(Widget page) async {
+              await Navigator.push(context, MaterialPageRoute(builder: (_) => page));
+              if (mounted) setState(() {});
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final b = bible;
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('Bíblia Sagrada'),
+                  actions: [
+                    if (versions.isNotEmpty)
+                      PopupMenuButton<String>(
+                        initialValue: c.version,
+                        onSelected: (v) {
+                          c.setVersion(v);
+                          setState(() => bible = null);
+                          _load();
+                        },
+                        itemBuilder: (_) => [
+                          for (final v in versions)
+                            PopupMenuItem(value: v, child: Text(v.toUpperCase())),
+                        ],
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          child: Center(
+                            child: Text(c.version.toUpperCase(),
+                                style: const TextStyle(fontWeight: FontWeight.bold)),
+                          ),
+                        ),
+                      ),
+                    IconButton(
+                      icon: Icon(c.dark ? Icons.light_mode : Icons.dark_mode),
+                      onPressed: () => c.setDark(!c.dark),
+                    ),
+                  ],
+                ),
+                body: error != null
+                    ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(error!)))
+                    : b == null
+                        ? const Center(child: CircularProgressIndicator())
+                        : _list(b),
+              );
+            }
+
+            Widget _list(Bible b) {
+              final n = b.books.length < bookNames.length ? b.books.length : bookNames.length;
+              final children = <Widget>[];
+
+              if (c.book < n && c.chapter < b.books[c.book].length) {
+                children.add(Card(
+                  margin: const EdgeInsets.all(12),
+                  child: ListTile(
+                    leading: const Icon(Icons.bookmark),
+                    title: const Text('Continuar lendo'),
+                    subtitle: Text('${bookNames[c.book]} ${c.chapter + 1}'),
+                    onTap: () => _open(ReaderPage(c, b, c.book, c.chapter)),
+                  ),
+                ));
+              }
+
+              for (var i = 0; i < n; i++) {
+                if (i == 0 || i == 39) {
+                  children.add(Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+                    child: Text(i == 0 ? 'ANTIGO TESTAMENTO' : 'NOVO TESTAMENTO',
+                        style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: Theme.of(context).colorScheme.primary)),
+                  ));
+                }
+                children.add(ListTile(
+                  title: Text(bookNames[i]),
+                  trailing: Text('${b.books[i].length}'),
+                  onTap: () => _open(ChaptersPage(c, b, i)),
+                ));
+              }
+              return ListView(children: children);
+            }
+          }
+
+          // ---------- Capítulos ----------
+
+          class ChaptersPage extends StatelessWidget {
+            const ChaptersPage(this.c, this.bible, this.book, {super.key});
+            final AppController c;
+            final Bible bible;
+            final int book;
+
+            @override
+            Widget build(BuildContext context) {
+              final total = bible.books[book].length;
+              return Scaffold(
+                appBar: AppBar(title: Text(bookNames[book])),
+                body: GridView.builder(
+                  padding: const EdgeInsets.all(12),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 5,
+                    mainAxisSpacing: 8,
+                    crossAxisSpacing: 8,
+                  ),
+                  itemCount: total,
+                  itemBuilder: (_, i) => FilledButton.tonal(
+                    onPressed: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => ReaderPage(c, bible, book, i)),
+                    ),
+                    child: Text('${i + 1}'),
+                  ),
+                ),
+              );
+            }
+          }
+
+          // ---------- Leitura ----------
+
+          class ReaderPage extends StatefulWidget {
+            const ReaderPage(this.c, this.bible, this.book, this.chapter, {super.key});
+            final AppController c;
+            final Bible bible;
+            final int book;
+            final int chapter;
+            @override
+            State<ReaderPage> createState() => _ReaderPageState();
+          }
+
+          class _ReaderPageState extends State<ReaderPage> {
+            late int ch = widget.chapter;
+            late final PageController pc = PageController(initialPage: widget.chapter);
+
+            @override
+            void initState() {
+              super.initState();
+              widget.c.setLast(widget.book, ch);
+            }
+
+            @override
+            void dispose() {
+              pc.dispose();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final c = widget.c;
+              final chapters = widget.bible.books[widget.book];
+              return ListenableBuilder(
+                listenable: c,
+                builder: (_, __) => Scaffold(
+                  appBar: AppBar(
+                    title: Text('${bookNames[widget.book]} ${ch + 1}'),
+                    actions: [
+                      IconButton(
+                          icon: const Icon(Icons.text_decrease),
+                          onPressed: () => c.setFont(c.font - 2)),
+                      IconButton(
+                          icon: const Icon(Icons.text_increase),
+                          onPressed: () => c.setFont(c.font + 2)),
+                    ],
+                  ),
+                  body: PageView.builder(
+                    controller: pc,
+                    itemCount: chapters.length,
+                    onPageChanged: (i) {
+                      setState(() => ch = i);
+                      c.setLast(widget.book, i);
+                    },
+                    itemBuilder: (_, i) {
+                      final verses = chapters[i];
+                      return ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+                        itemCount: verses.length,
+                        itemBuilder: (_, v) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 6),
+                          child: Text.rich(
+                            TextSpan(children: [
+                              TextSpan(
+                                text: '${v + 1} ',
+                                style: TextStyle(
+                                  fontSize: c.font * 0.65,
+                                  fontWeight: FontWeight.bold,
+                                  color: Theme.of(context).colorScheme.primary,
+                                ),
+                              ),
+                              TextSpan(text: verses[v]),
+                            ]),
+                            style: TextStyle(fontSize: c.font, height: 1.5),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      # Versões em domínio público: coloque outros .json em assets/bibles/ no repositório
+      # (ou adicione mais linhas curl aqui). Confira a licença de cada arquivo.
+      - name: Baixar Bíblia (ACF)
+        run: |
+          mkdir -p assets/bibles
+          if ! ls assets/bibles/*.json >/dev/null 2>&1; then
+            curl -fL -o assets/bibles/acf.json \
+              https://raw.githubusercontent.com/thiagobodruk/biblia/master/json/acf.json
+          fi
+
+      - run: flutter pub get
+      - run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: biblia-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
